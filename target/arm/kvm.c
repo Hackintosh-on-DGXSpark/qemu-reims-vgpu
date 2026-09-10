@@ -33,6 +33,8 @@
 #include "hw/pci/pci.h"
 #include "exec/memattrs.h"
 #include "system/address-spaces.h"
+#include "system/memory.h"
+#include "hw/core/cpu.h"
 #include "gdbstub/enums.h"
 #include "hw/core/boards.h"
 #include "hw/core/irq.h"
@@ -1445,6 +1447,58 @@ static void kvm_arm_vm_state_change(void *opaque, bool running, RunState state)
     }
 }
 
+/*
+ * Apple's firmware stores to a GIC register with a pre-indexed addressing form
+ * that Linux KVM on arm64 cannot describe when the stage-2 abort carries no
+ * instruction syndrome (ESR_EL2.ISV == 0). QEMU would otherwise inject an
+ * external data abort and the guest would panic. Decode that one instruction
+ * form from guest memory and perform the access here instead.
+ *
+ * Only GPR stores of the pre/post-indexed immediate form are handled; loads and
+ * every other encoding fall back to the caller's existing behaviour.
+ */
+static bool kvm_arm_emulate_nisv_store(ARMCPU *cpu, uint64_t fault_ipa)
+{
+    CPUState *cs = CPU(cpu);
+    CPUARMState *env = &cpu->env;
+    uint32_t insn;
+    uint64_t base, writeback, mask, value;
+    int size, opc, index, rn, rt, offset;
+
+    /* AArch64 load/store register (immediate pre/post-indexed):
+     * size[31:30] 111 0 00 opc[23:22] 0 imm9[20:12] idx[11:10] Rn Rt
+     */
+    if (cpu_memory_rw_debug(cs, env->pc, (uint8_t *)&insn, sizeof(insn), 0)) {
+        return false;
+    }
+    if ((insn & 0x3f200000) != 0x38000000) {
+        return false;
+    }
+    index = extract32(insn, 10, 2);
+    opc = extract32(insn, 22, 2);
+    rn = extract32(insn, 5, 5);
+    size = extract32(insn, 30, 2);
+    rt = extract32(insn, 0, 5);
+    offset = sextract32(insn, 12, 9);
+    base = env->xregs[rn];
+    if ((index != 0x3 && index != 0x1) || opc != 0 || rn == 31) {
+        return false;
+    }
+    /*
+     * The effective address is a guest VA that maps to the faulting IPA; the
+     * MMU already resolved it, so write the device through fault_ipa and update
+     * the base register with the register-file address.
+     */
+    writeback = base + offset;
+    mask = size == 3 ? UINT64_MAX : (UINT64_C(1) << (8 << size)) - 1;
+    value = env->xregs[rt] & mask;
+    address_space_rw(&address_space_memory, fault_ipa, MEMTXATTRS_UNSPECIFIED,
+                     (uint8_t *)&value, 1 << size, true);
+    env->xregs[rn] = writeback;
+    env->pc += 4;
+    return true;
+}
+
 /**
  * kvm_arm_handle_dabt_nisv:
  * @cpu: ARMCPU
@@ -1458,6 +1512,19 @@ static int kvm_arm_handle_dabt_nisv(ARMCPU *cpu, uint64_t esr_iss,
                                     uint64_t fault_ipa)
 {
     CPUARMState *env = &cpu->env;
+    /*
+     * Try to retire the faulting access ourselves before falling back to
+     * asking KVM to inject an external abort.
+     */
+    kvm_cpu_synchronize_state(CPU(cpu));
+    if (kvm_arm_emulate_nisv_store(cpu, fault_ipa)) {
+        static unsigned int reported;
+        if (reported++ < 4) {
+            warn_report("retired a no-syndrome MMIO store at 0x%" PRIx64,
+                        fault_ipa);
+        }
+        return 0;
+    }
     /*
      * Request KVM to inject the external data abort into the guest
      */

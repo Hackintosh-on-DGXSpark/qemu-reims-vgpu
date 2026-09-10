@@ -153,13 +153,19 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
   else
     error('unknown REIMS_VGPU_BACKEND: ' + reims_vgpu_backend_kind + ' (metal | vulkan)')
   endif
-  reims_vgpu_built = reims_vgpu_repo_dir / 'target' / 'release' / 'libreims_vgpu.a'
+  # CARGO_TARGET_DIR keeps the Rust build products out of the submodule tree.
+  reims_vgpu_target_dir = run_command(
+    find_program('sh'), '-c',
+    'printf %s "${REIMS_VGPU_TARGET_DIR:-' + reims_vgpu_repo_dir + '/target}"',
+    check: true).stdout().strip()
+  reims_vgpu_built = reims_vgpu_target_dir / 'release' / 'libreims_vgpu.a'
   reims_vgpu_a = custom_target('reims-vgpu-staticlib',
     output: 'libreims_vgpu.a',
     console: true,
     build_always_stale: true,
     command: [find_program('sh'), '-c',
-      '"' + cargo.full_path() + '" build --locked --release --manifest-path "' +
+      'CARGO_TARGET_DIR="' + reims_vgpu_target_dir + '" "' + cargo.full_path() +
+      '" build --locked --release --manifest-path "' +
       reims_vgpu_repo_dir + '/Cargo.toml" -p reims-vgpu ' + reims_vgpu_cargo_features +
       ' && ( cmp -s "' + reims_vgpu_built + '" "@OUTPUT@" || cp "' +
       reims_vgpu_built + '" "@OUTPUT@" )'])

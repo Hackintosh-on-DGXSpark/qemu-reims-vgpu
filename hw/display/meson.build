@@ -159,7 +159,7 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
     console: true,
     build_always_stale: true,
     command: [find_program('sh'), '-c',
-      '"' + cargo.full_path() + '" build --release --manifest-path "' +
+      '"' + cargo.full_path() + '" build --locked --release --manifest-path "' +
       reims_vgpu_repo_dir + '/Cargo.toml" -p reims-vgpu ' + reims_vgpu_cargo_features +
       ' && ( cmp -s "' + reims_vgpu_built + '" "@OUTPUT@" || cp "' +
       reims_vgpu_built + '" "@OUTPUT@" )'])

@@ -30,10 +30,12 @@
 #include "hw/core/cpu.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
+#include "hw/vmapple/vmapple.h"
 #include "qom/object.h"
 #include "system/address-spaces.h"
 #include "system/hw_accel.h"
 #include "system/memory.h"
+#include "system/ramblock.h"
 #include "system/runstate.h"
 #include "ui/console.h"
 #include "ui/surface.h"
@@ -171,26 +173,8 @@ static int reims_vgpu_mmio_window_main_loop(void)
  */
 static int reims_vgpu_mmio_read_xreg(void *ctx, uint32_t index, uint64_t *out)
 {
-#if defined(CONFIG_DARWIN)
-    CPUState *cs = current_cpu;
-    ARMCPU *cpu;
-
-    if (!out || index >= 32) {
-        return -1;
-    }
-    if (!cs) {
-        return -1;
-    }
-    cpu_synchronize_state(cs);
-    cpu = ARM_CPU(cs);
-    *out = cpu->env.xregs[index];
-    return 0;
-#else
     (void)ctx;
-    (void)index;
-    (void)out;
-    return -1;
-#endif
+    return vmapple_read_current_xreg(index, out) ? 0 : -1;
 }
 
 /*
@@ -210,8 +194,9 @@ static int reims_vgpu_mmio_read_xreg(void *ctx, uint32_t index, uint64_t *out)
  * bought nothing and every fragmented map leaked a VA reservation until
  * teardown. `map_pages_stable` is 0 accordingly.
  *
- * Non-Darwin hosts: fail closed (no mach_vm); type-11 writeback uses GPA
- * copies through HostOps until a Linux aliasing path lands.
+ * Linux uses direct RAMBlock pointers for contiguous runs. Shared file-backed
+ * RAM also permits aligned packed mappings for scattered pages. As on the PCI
+ * path, those aliases remain valid until backend teardown or reset.
  */
 static int reims_vgpu_mmio_map_pages(void *ctx, const uint64_t *gpas,
                                   size_t count, void **out_ptr)
@@ -298,11 +283,115 @@ fail:
     g_free(hvas);
     return -1;
 #else
-    (void)ctx;
-    (void)gpas;
-    (void)count;
-    (void)out_ptr;
-    return -1;
+    const hwaddr page = REIMS_VGPU_GUEST_PAGE_SIZE_ARM64E;
+    ReimsVGPUMMIOState *s = ctx;
+    uint8_t *base = NULL;
+    MemoryRegion *base_mr = NULL;
+    size_t i;
+
+    if (!ctx || !gpas || count == 0 || !out_ptr ||
+        count > SIZE_MAX / page) {
+        qemu_log_mask(LOG_GUEST_ERROR, "Reims map_pages: invalid callback arguments\n");
+        return -1;
+    }
+
+    rcu_read_lock();
+    for (i = 0; i < count; i++) {
+        hwaddr xlat, plen = page;
+        MemoryRegion *mr;
+        uint8_t *hva;
+
+        mr = address_space_translate(&address_space_memory, gpas[i],
+                                     &xlat, &plen, true,
+                                     MEMTXATTRS_UNSPECIFIED);
+        if (!mr || !memory_region_is_ram(mr) || plen < page) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "Reims map_pages: invalid RAM translation gpa=%#" PRIx64
+                          " len=%#" PRIx64 "\n", (uint64_t)gpas[i], (uint64_t)plen);
+            goto linux_fail;
+        }
+        hva = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+        if (i == 0) {
+            base = hva;
+            base_mr = mr;
+            if (((uintptr_t)base & (page - 1)) != 0) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "Reims map_pages: host alignment remainder=%zu, required=%zu\n",
+                              (size_t)((uintptr_t)base & (page - 1)), (size_t)page);
+                goto linux_fail;
+            }
+        } else if (mr != base_mr || hva != base + i * page) {
+            goto linux_fail;
+        }
+    }
+    rcu_read_unlock();
+
+    *out_ptr = base;
+    return 0;
+
+linux_fail:
+    rcu_read_unlock();
+    {
+        size_t total = count * page;
+        uint8_t *reservation, *view;
+        ReimsVGPUMMIOPageView held;
+        static unsigned int reported;
+
+        if (total > SIZE_MAX - page) {
+            return -1;
+        }
+        reservation = mmap(NULL, total + page, PROT_NONE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (reservation == MAP_FAILED) {
+            return -1;
+        }
+        /* Keep the padding reserved too: only replace mappings we own. */
+        view = (uint8_t *)(((uintptr_t)reservation + page - 1) & ~(page - 1));
+        rcu_read_lock();
+        for (i = 0; i < count; i++) {
+            hwaddr xlat, plen = page;
+            MemoryRegion *mr = address_space_translate(&address_space_memory,
+                gpas[i], &xlat, &plen, true, MEMTXATTRS_UNSPECIFIED);
+            RAMBlock *rb;
+            ram_addr_t rb_offset, fd_offset;
+            int fd;
+
+            if (!mr || !memory_region_is_ram(mr) || plen < page) {
+                goto alias_fail;
+            }
+            rb = qemu_ram_block_from_host(
+                (uint8_t *)memory_region_get_ram_ptr(mr) + xlat, false, &rb_offset);
+            if (!rb || !qemu_ram_is_shared(rb)) {
+                goto alias_fail;
+            }
+            fd = qemu_ram_get_fd(rb);
+            if (fd < 0 || rb_offset > RAM_ADDR_MAX - qemu_ram_get_fd_offset(rb)) {
+                goto alias_fail;
+            }
+            fd_offset = qemu_ram_get_fd_offset(rb) + rb_offset;
+            if ((fd_offset & (page - 1)) != 0 ||
+                mmap(view + i * page, page, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_FIXED, fd, fd_offset) == MAP_FAILED) {
+                goto alias_fail;
+            }
+        }
+        rcu_read_unlock();
+        held.ptr = reservation;
+        held.len = total + page;
+        g_array_append_val(s->page_views, held);
+        *out_ptr = view;
+        if (reported++ < 4) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "Reims map_pages: shared alias ready, pages=%zu\n", count);
+        }
+        return 0;
+
+alias_fail:
+        rcu_read_unlock();
+        munmap(reservation, total + page);
+        qemu_log_mask(LOG_GUEST_ERROR, "Reims map_pages: shared alias failed\n");
+        return -1;
+    }
 #endif
 }
 
@@ -343,35 +432,35 @@ static void reims_vgpu_mmio_unmap_pages(void *ctx, void *ptr, size_t len)
 }
 
 /*
- * Teardown backstop. Every view should already have been released by
- * unmap_pages, so anything still here is a caller that mapped and never freed —
- * reclaim it, but say so rather than reclaiming quietly, because the silent
- * version of this function is what hid the leak that made it necessary.
+ * Darwin's transient views should have been released already. Linux retains
+ * shared reservations until the backend has dropped every reference to them.
  */
 static void reims_vgpu_mmio_free_page_views(ReimsVGPUMMIOState *s)
 {
-#if defined(CONFIG_DARWIN)
     size_t i;
 
     if (!s->page_views) {
         return;
     }
+#if defined(CONFIG_DARWIN)
     if (s->page_views->len != 0) {
         qemu_log_mask(LOG_UNIMP,
                       "%s: %u guest page view(s) still mapped at teardown\n",
                       TYPE_REIMS_VGPU_MMIO, s->page_views->len);
     }
+#endif
     for (i = 0; i < s->page_views->len; i++) {
         ReimsVGPUMMIOPageView *view =
             &g_array_index(s->page_views, ReimsVGPUMMIOPageView, i);
+#if defined(CONFIG_DARWIN)
         mach_vm_deallocate(mach_task_self(),
                            (mach_vm_address_t)(uintptr_t)view->ptr,
                            view->len);
+#else
+        munmap(view->ptr, view->len);
+#endif
     }
     g_array_set_size(s->page_views, 0);
-#else
-    (void)s;
-#endif
 }
 
 /*
@@ -983,16 +1072,19 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
         .guest_ram_regions = reims_vgpu_shim_guest_ram_regions,
         .is_ram_gpa = reims_vgpu_shim_is_ram_gpa,
         /*
-         * 0: a fragmented list gets a packed mach_vm_remap view whose lifetime
-         * the caller owns and ends through unmap_pages. Only a pointer that
-         * needs no release at all may claim 1, and this shim cannot promise
-         * that without knowing the run was host-contiguous.
+         * Darwin can return transient packed mach_vm_remap views. Linux only
+         * accepts direct RAMBlock aliases, which remain valid for the VM
+         * lifetime and require no unmap.
          *
          * The GPU rail does not read this and must not: it imports the spans
          * guest_ram_regions names, which are RAMBlock mappings this shim never
          * built and never releases.
          */
+#if defined(CONFIG_DARWIN)
         .map_pages_stable = 0,
+#else
+        .map_pages_stable = 1,
+#endif
         .track_guest_writes = reims_vgpu_mmio_track_guest_writes,
         .untrack_guest_writes = reims_vgpu_mmio_untrack_guest_writes,
         .guest_write_gen = reims_vgpu_mmio_guest_write_gen,
